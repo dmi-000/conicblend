@@ -10,20 +10,20 @@
 //   • Blend:  (1-w)·win[j-2](t)  +  w·win[j-1](t),  w = smoothstep(s, N)
 //   • C^N continuity: same window (win[j-2]) evaluates from both sides of t=times[j].
 //
-// Parametrization: cross-ratio orbit — the 5 stereographic slopes s_i from the base
-//   point P₀ are encoded as cross-ratio values r_i = q_i/(q_i+1) where
-//   q_i = (s_i−s₀)(s₂−s₄) / [(s_i−s₄)(s₂−s₀)].  Degree-4 Lagrange interpolates
-//   r(t); the Möbius inversion r→q→s then evaluates the rational conic map
-//   x=x₀+u(s), y=y₀+s·u(s).
+// Parametrization: φ = 2·arctan(s) orbit (mirrors conicspline.py) —
+//   P₀ is the algebraic vertex of the conic (where ∂Q/∂x = 0), or the inner-3
+//   control point minimising |L/M| as fallback.  Slopes s_i = (y_i−y₀)/(x_i−x₀)
+//   give φ_i = 2·arctan(s_i); after ±π unwrapping, φ is monotone for valid windows.
+//   A degree-4 Lagrange polynomial (or PCHIP fallback) interpolates φ(t); the
+//   rational conic map x=x₀+u(s), y=y₀+s·u(s) evaluates the orbit.
 //
-// Invariance: the cross-ratio is preserved under any Möbius transform of the slopes,
-//   which is exactly what an affine transform of the plane induces.  Result:
-//   blend_curve(..., conic_tag{}) is exactly affine-invariant to floating-point
-//   precision (~2e-13) and nearly projectively invariant (~8e-9 at 10% perspective).
+// Using the algebraic vertex as P₀ ensures the same P₀ for any window on the
+// same conic, so overlapping windows share the same orbit → exact blend for
+// locally-conic data.  Works uniformly for ellipses, hyperbolas, and parabolas.
 //
-// Fallback: if any ConicWindow fails (degenerate anchor slopes, non-monotone
-//   cross-ratio, orbit reconstruction error > 1e-3), the entire blend_curve call
-//   degrades to circle windows (conicblend_circle.hpp).
+// Fallback: ConicWindows that fail (non-monotone φ, orbit reconstruction
+//   error > 1e-3, or cross-branch without caller permission) fall back to
+//   LagrangeWindow (degree-4 Lagrange through 5 control points).
 //
 // Minimum control points: 6  (yields 1 blended segment, j=2).
 // Blended segments: j = 2, …, n−4.
@@ -493,19 +493,16 @@ class ConicWindow {
     bool swapped_;    // true if x↔y coordinate swap was applied in principal frame
 
     // Rational map parameters (in principal frame, B=0)
-    double x0_, y0_;  // canonical P0 = control point with smallest |L/M|
-    double A_e_, C_e_, L_e_, M_e_;  // L_e=2*A_e*x0+D_e, M_e=2*C_e*y0+E_e; B_e=0
-    double F_coeff_;   // original F coefficient (unused after fit but stored)
+    // P₀ = algebraic vertex (where L_e=0) when computable; inner-3 argmin |L/M| otherwise.
+    double x0_, y0_;  // P₀ coordinates
+    double A_e_, C_e_, L_e_, M_e_;  // L_e=2*A_e*x0+D_e (=0 at vertex), M_e=2*C_e*y0+E_e; B_e=0
 
-    // phi(t) interpolant — Lagrange quartic (C^∞) when monotone, else PCHIP (C^1)
-    // Stores either cross-ratio r_i ∈ [0,1] (same-branch) or φ_i = 2·arctan(s_i)
-    // unwrapped (cross-branch), selected at construction.
+    // phi(t) interpolant — stores φ_i = 2·arctan(s_i), unwrapped.
+    // Lagrange quartic (C^∞) when monotone, else PCHIP (C^1).
     detail::LagrangePhi5 phi_lagrange_;
     detail::Pchip5       phi_pchip_;
     bool use_lagrange_;
-    bool use_phi_unwrap_;  // true → φ-arctan-unwrap (cross-branch); false → cross-ratio (same-branch)
     double ts_[5];   // control times (for range queries)
-    double s0_cr_, s2_cr_, s4_cr_;  // anchor slopes for cross-ratio inversion (unused when use_phi_unwrap_)
 
 public:
     ConicWindow() : valid_(false) {}
@@ -519,7 +516,7 @@ public:
         VecN<Dim> const& p3, VecN<Dim> const& p4,
         double t0, double t1, double t2, double t3, double t4,
         bool allow_cross_branch = false)
-        : valid_(false), use_phi_unwrap_(false)
+        : valid_(false)
     {
         VecN<Dim> pts5[5] = {p0, p1, p2, p3, p4};
         ts_[0]=t0; ts_[1]=t1; ts_[2]=t2; ts_[3]=t3; ts_[4]=t4;
@@ -558,7 +555,7 @@ public:
         detail::fit_conic_2d(pts2d, coeffs);
         double A = coeffs[0], B = coeffs[1], C = coeffs[2];
         double D = coeffs[3], E = coeffs[4], F = coeffs[5];
-        F_coeff_ = F;
+        (void)F;
 
         // 3. Rotate to principal frame (B_p=0 by construction)
         detail::Eig2x2 epf = detail::eigh2(A, B*0.5, C);
@@ -628,7 +625,13 @@ public:
         // lam0, lam1 are already the principal-frame eigenvalues (smaller |val| first).
         // is_hyperbola ↔ they have opposite signs ↔ 4AC − B² < 0.
         bool is_cross_branch = false;
-        if (lam0 * lam1 < 0.0) {
+        // Near-parabola guard: if |lam0| << |lam1| the smaller eigenvalue is
+        // numerically zero (true parabola).  A tiny negative lam0 would give
+        // lam0*lam1 < 0 and trigger the cross-branch check, but the "center"
+        // then lies at infinity → catastrophic cancellation in the sign test.
+        // Skip cross-branch detection for near-parabola windows.
+        if (lam0 * lam1 < 0.0 &&
+            std::abs(lam0) > 1e-6 * std::abs(lam1)) {
             // Conic center in SVD local frame
             double det4 = 4.0*A*C - B*B;  // < 0 for hyperbola
             double cx = (-2.0*C*D + B*E) / det4;
@@ -649,20 +652,27 @@ public:
             }
         }
 
-        // 5–6. Find P0 = control point that yields monotone parameter values.
+        // 5–6. Find P₀ for φ = 2·arctan(s) parametrization (mirrors conicspline.py).
         //
-        // We try control points in order {0, 4, 1, 3, 2} (endpoints first, so that
-        // for a forward-traversed arc the endpoints are most likely to yield monotone
-        // slopes to the other 4 points).  For each candidate k we:
-        //   (a) check |M_k| ≥ EPS  (need non-degenerate tangent direction)
-        //   (b) compute s_i = slope from P0 to pts_e[i], using tangent -L/M at k itself
-        //   (c) compute cross-ratio r_i = q_i/(q_i+1); check strict monotone increase
-        // Accept the first k that satisfies (a)+(c).
-        // If no k works and allow_cross_branch && is_cross_branch: retry with
-        // φ = 2·arctan(s_i) unwrapped (projective arc through ∞).
+        // Strategy:
+        //   Primary: algebraic vertex (where L_e = 2*A_e*x + D_e = 0, so s₀=0).
+        //     This is an intrinsic conic property — same vertex for any window on
+        //     the same conic → identical orbits for both overlapping windows →
+        //     exact blend for locally-conic data.  For parabolas (C_e≈0) the vertex
+        //     exists and gives trivially monotone φ (s_i = x_i, arctan is monotone).
+        //   Fallback: argmin |L_k/M_k| over inner-3 control points (k=1,2,3).
+        //     These three points are shared by both overlapping windows at every
+        //     blend junction, so the same argmin is chosen by both → same P₀.
+        //
+        // Parametrization: φ_i = 2·arctan(s_i), s_i = (y_i−y₀)/(x_i−x₀).
+        // After ±π unwrapping, φ is monotone iff the arc doesn't double back.
+        // Works uniformly for same-branch and cross-branch windows; no separate
+        // cross-ratio path needed.
 
-        constexpr double EPS_COEFF = 1e-12;
-        constexpr double EPS_DX    = 1e-9;
+        constexpr double EPS_COEFF  = 1e-12;
+        constexpr double EPS_DX     = 1e-9;
+        constexpr double EPS_VERTEX = 1e-9;
+        constexpr double PI         = 3.14159265358979323846;
 
         // Pre-compute L_k, M_k (conic gradient components) at all 5 control points
         double L_all[5], M_all[5];
@@ -671,163 +681,115 @@ public:
             M_all[k] = 2.0*C_e*pts_e[k][1] + E_e;
         }
 
-        // Candidate order: endpoints of the arc first, then inner points
-        constexpr int order[5] = {0, 4, 1, 3, 2};
+        // --- Step 5a: Try algebraic vertex as P₀ ---
+        // Solve L_e = 0: x_v = -D_e/(2*A_e).
+        // Then solve the conic for y_v; pick root closest to control-point centroid.
+        bool   has_vertex = false;
+        double x0_vert = 0.0, y0_vert = 0.0;
 
-        bool found = false;
-        double phi_vals[5];   // stores cross-ratio r_i values (renamed in a future cleanup)
-        int k0_used = 0;
-        double L_e_used = 0.0, M_e_used = 0.0;
-        double x0_used = 0.0, y0_used = 0.0;
-        double s0_cr_used = 0.0, s2_cr_used = 0.0, s4_cr_used = 0.0;
+        if (std::abs(A_e) >= EPS_VERTEX * std::max(std::abs(C_e), 1.0)) {
+            double x_v      = -D_e / (2.0 * A_e);
+            double cv_const = A_e*x_v*x_v + D_e*x_v + F;  // = F − D_e²/(4*A_e)
+            if (std::abs(C_e) < EPS_VERTEX) {
+                // Parabola-like: linear in y → E_e*y + cv_const = 0
+                if (std::abs(E_e) >= EPS_VERTEX) {
+                    double y_v = -cv_const / E_e;
+                    if (std::abs(2.0*C_e*y_v + E_e) >= EPS_COEFF) {
+                        x0_vert = x_v; y0_vert = y_v; has_vertex = true;
+                    }
+                }
+            } else {
+                double disc = E_e*E_e - 4.0*C_e*cv_const;
+                if (disc >= 0.0) {
+                    double sq = std::sqrt(disc);
+                    double y1 = (-E_e + sq) / (2.0*C_e);
+                    double y2 = (-E_e - sq) / (2.0*C_e);
+                    double cy_mean = 0.0;
+                    for (int i = 0; i < 5; ++i) cy_mean += pts_e[i][1];
+                    cy_mean /= 5.0;
+                    double y_v = (std::abs(y1-cy_mean) <= std::abs(y2-cy_mean)) ? y1 : y2;
+                    if (std::abs(2.0*C_e*y_v + E_e) >= EPS_COEFF) {
+                        x0_vert = x_v; y0_vert = y_v; has_vertex = true;
+                    }
+                }
+            }
+        }
 
-        // Cross-ratio parametrization only works for same-branch windows.
-        // Skip it when is_cross_branch: slopes pass through ±∞ at the asymptote,
-        // making cross-ratio denominators zero → forced failure for all P0.
-        if (!is_cross_branch) for (int ci = 0; ci < 5; ++ci) {
-            int k = order[ci];
-            double Mk = M_all[k];
-            if (std::abs(Mk) < EPS_COEFF) continue;
-
-            double x0 = pts_e[k][0], y0 = pts_e[k][1];
-            double Lk = L_all[k];
-
-            // Compute s_vals with this P0
+        // --- Step 5b: Helper to compute φ_i = 2·arctan(s_i) and check monotonicity ---
+        // k_self: index of P₀ in pts_e (use tangent slope there), or -1 if vertex.
+        auto phi_mono = [&](double x0, double y0, double Le, double Me,
+                            int k_self, double pv[5]) -> bool
+        {
             double sv[5];
             for (int i = 0; i < 5; ++i) {
-                if (i == k) {
-                    sv[i] = -Lk / Mk;  // tangent slope at P0
+                if (i == k_self) {
+                    sv[i] = -Le / Me;   // tangent slope at control-point P₀
                 } else {
                     double dx = pts_e[i][0] - x0;
                     double dy = pts_e[i][1] - y0;
-                    double adx = std::abs(dx);
-                    double ady = std::abs(dy);
-                    if (adx >= EPS_DX * (ady + 1.0))
+                    if (std::abs(dx) >= EPS_DX * (std::abs(dy) + 1.0))
                         sv[i] = dy / dx;
                     else
                         sv[i] = (dy >= 0.0 ? 1.0 : -1.0) * 1e15;
                 }
             }
-
-            // Cross-ratio parametrization: invariant under affine transforms.
-            // Under any affine map, slopes transform as a Möbius map s → (cs+d)/(as+b).
-            // The cross-ratio q_i = (s_i-s_0)(s_2-s_4)/[(s_i-s_4)(s_2-s_0)] is
-            // preserved by any Möbius transform, so the Lagrange interpolant of q(t)
-            // is identical before and after any affine transform of the plane.
-            //
-            // We normalize to r_i = q_i/(q_i+1) ∈ [0,1] to keep all 5 values finite:
-            //   r_0 = 0 always (q_0 = 0)
-            //   r_4 = 1 always (q_4 = ∞, since s_4 is the third anchor)
-            // Anchors: sv[0], sv[2], sv[4] (first, middle, last control-point slopes).
-            constexpr double EPS_CR = 1e-9;
-            double d20 = sv[2] - sv[0];  // s2 - s0
-            double d24 = sv[2] - sv[4];  // s2 - s4
-            double d04 = sv[0] - sv[4];  // s0 - s4
-            if (std::abs(d20) < EPS_CR || std::abs(d24) < EPS_CR || std::abs(d04) < EPS_CR)
-                continue;  // degenerate anchors (slopes too close) → try next P0
-
-            double pv[5];
-            pv[0] = 0.0;
-            pv[4] = 1.0;
-            bool valid_cr = true;
-            for (int i = 1; i <= 3; ++i) {
-                double dsi4 = sv[i] - sv[4];
-                if (std::abs(dsi4) < EPS_CR) { valid_cr = false; break; }  // s_i ≈ s4 (asymptote)
-                double q = (sv[i] - sv[0]) * d24 / (dsi4 * d20);
-                if (q <= 0.0) { valid_cr = false; break; }  // non-positive → non-monotone arc
-                pv[i] = q / (q + 1.0);
+            for (int i = 0; i < 5; ++i)
+                pv[i] = 2.0 * std::atan(sv[i]);
+            for (int i = 0; i < 4; ++i) {
+                double d = pv[i+1] - pv[i];
+                while (d >  PI) { d -= 2.0*PI; pv[i+1] -= 2.0*PI; }
+                while (d < -PI) { d += 2.0*PI; pv[i+1] += 2.0*PI; }
             }
-            if (!valid_cr) continue;
+            bool mono_up = true, mono_dn = true;
+            for (int i = 0; i < 4; ++i) {
+                if (pv[i+1] <= pv[i]) mono_up = false;
+                if (pv[i+1] >= pv[i]) mono_dn = false;
+            }
+            return mono_up || mono_dn;
+        };
 
-            // Check monotonicity of r (r_0=0 < r_4=1, so only strict increase possible)
-            bool mono = true;
-            for (int i = 0; i < 4; ++i)
-                if (pv[i+1] <= pv[i]) { mono = false; break; }
-            if (!mono) continue;  // try next candidate
+        // --- Step 5c: Try P₀ candidates, accept first with monotone φ ---
+        bool   found    = false;
+        double phi_vals[5];
+        double x0_used  = 0.0, y0_used  = 0.0;
+        double L_e_used = 0.0, M_e_used = 0.0;
 
-            // Accepted
-            found = true;
-            k0_used    = k;
-            L_e_used   = Lk;
-            M_e_used   = Mk;
-            x0_used    = x0;
-            y0_used    = y0;
-            s0_cr_used = sv[0];
-            s2_cr_used = sv[2];
-            s4_cr_used = sv[4];
-            for (int i = 0; i < 5; ++i) phi_vals[i] = pv[i];
-            break;
+        if (has_vertex) {
+            double M_v = 2.0*C_e*y0_vert + E_e;
+            if (phi_mono(x0_vert, y0_vert, 0.0, M_v, /*k_self=*/-1, phi_vals)) {
+                x0_used = x0_vert; y0_used = y0_vert;
+                L_e_used = 0.0;    M_e_used = M_v;
+                found = true;
+            }
         }
 
-        // Phi-unwrap fallback: only reached when cross-ratio loop found nothing AND
-        // allow_cross_branch is set AND the window genuinely spans two branches.
-        // φ_i = 2·arctan(s_i) (φ_c = 0 since B_e = 0 in principal frame).
-        // After unwrapping the ±π jumps, check for strict monotonicity.
-        // The rational eval is identical to the cross-ratio path (same u = -(L+Ms)/Q(s));
-        // the only difference is inversion: r→s via tan(r/2) instead of Möbius.
-        if (!found && is_cross_branch && allow_cross_branch) {
-            for (int ci = 0; ci < 5 && !found; ++ci) {
-                int k = order[ci];
+        if (!found) {
+            // Argmin |L/M| over inner-3 (indices 1,2,3)
+            double best = 1e30;
+            int k_best = -1;
+            for (int k = 1; k <= 3; ++k) {
                 double Mk = M_all[k];
                 if (std::abs(Mk) < EPS_COEFF) continue;
-
-                double x0 = pts_e[k][0], y0 = pts_e[k][1];
-                double Lk = L_all[k];
-
-                double sv[5];
-                for (int i = 0; i < 5; ++i) {
-                    if (i == k) {
-                        sv[i] = -Lk / Mk;
-                    } else {
-                        double dx = pts_e[i][0] - x0;
-                        double dy = pts_e[i][1] - y0;
-                        double adx = std::abs(dx);
-                        double ady = std::abs(dy);
-                        if (adx >= EPS_DX * (ady + 1.0))
-                            sv[i] = dy / dx;
-                        else
-                            sv[i] = (dy >= 0.0 ? 1.0 : -1.0) * 1e15;
-                    }
+                double r = std::abs(L_all[k] / Mk);
+                if (r < best) { best = r; k_best = k; }
+            }
+            if (k_best >= 0) {
+                double Lk = L_all[k_best], Mk = M_all[k_best];
+                if (phi_mono(pts_e[k_best][0], pts_e[k_best][1], Lk, Mk, k_best, phi_vals)) {
+                    x0_used = pts_e[k_best][0]; y0_used = pts_e[k_best][1];
+                    L_e_used = Lk; M_e_used = Mk;
+                    found = true;
                 }
-
-                // φ_i = 2·arctan(s_i),  φ_c = 0 (principal frame, B_e=0)
-                double pv[5];
-                for (int i = 0; i < 5; ++i)
-                    pv[i] = 2.0 * std::atan(sv[i]);
-
-                // Unwrap: bring each consecutive step into (−π, π)
-                for (int i = 0; i < 4; ++i) {
-                    double d = pv[i+1] - pv[i];
-                    constexpr double PI = 3.14159265358979323846;
-                    while (d >  PI) { d -= 2.0*PI;  pv[i+1] -= 2.0*PI; }
-                    while (d < -PI) { d += 2.0*PI;  pv[i+1] += 2.0*PI; }
-                }
-
-                bool mono_up = true, mono_dn = true;
-                for (int i = 0; i < 4; ++i) {
-                    if (pv[i+1] <= pv[i]) mono_up = false;
-                    if (pv[i+1] >= pv[i]) mono_dn = false;
-                }
-                if (!mono_up && !mono_dn) continue;
-
-                found         = true;
-                use_phi_unwrap_ = true;
-                k0_used       = k;
-                L_e_used      = Lk;
-                M_e_used      = Mk;
-                x0_used       = x0;
-                y0_used       = y0;
-                for (int i = 0; i < 5; ++i) phi_vals[i] = pv[i];
-                // s0_cr_, s2_cr_, s4_cr_ are unused for phi-unwrap path
             }
         }
 
-        if (!found) return;  // no P0 gave monotone parameter values → invalid
+        // Cross-branch windows are only accepted when caller explicitly permits it.
+        if (found && is_cross_branch && !allow_cross_branch) found = false;
 
-        x0_ = x0_used;  y0_ = y0_used;
+        if (!found) return;  // no P₀ gave monotone φ → invalid
+
+        x0_ = x0_used; y0_ = y0_used;
         A_e_ = A_e;  C_e_ = C_e;  L_e_ = L_e_used;  M_e_ = M_e_used;
-        s0_cr_ = s0_cr_used;  s2_cr_ = s2_cr_used;  s4_cr_ = s4_cr_used;
-        (void)k0_used;
 
         // 7. Build phi(t) interpolant.
         //    Try the degree-4 Lagrange polynomial first: it is C^∞ everywhere
@@ -876,29 +838,9 @@ private:
     //   u(s) = -(L_e + M_e*s) / (A_e + C_e*s²)
     VecN<Dim> eval_at_(double t) const
     {
+        // φ = 2·arctan(s) → s = tan(φ/2).  Near φ = ±π the arc crosses ∞ (asymptote).
         double param = use_lagrange_ ? phi_lagrange_.eval(t) : phi_pchip_.eval(t);
-        double s;
-        if (use_phi_unwrap_) {
-            // Phi-unwrap path: param IS φ = 2·arctan(s), so s = tan(φ/2).
-            // Near φ = ±π the arc crosses ∞ (asymptote); tan blows up naturally.
-            s = std::tan(param * 0.5);
-        } else {
-            // Cross-ratio path: param is r ∈ [0,1]; invert to s via Möbius map.
-            // r → q = r/(1-r) → s = [q*s4*(s2-s0) − s0*(s2-s4)] / [q*(s2-s0) − (s2-s4)]
-            double one_m_r = 1.0 - param;
-            constexpr double EPS_R = 1e-13;
-            if (std::abs(one_m_r) < EPS_R) {
-                s = s4_cr_;  // r ≈ 1 → q → ∞ → s → s4
-            } else {
-                double q   = param / one_m_r;
-                double d20 = s2_cr_ - s0_cr_;
-                double d24 = s2_cr_ - s4_cr_;
-                double num = q * s4_cr_ * d20 - s0_cr_ * d24;
-                double den = q * d20 - d24;
-                constexpr double EPS_DEN = 1e-10;
-                s = (std::abs(den) < EPS_DEN) ? 1e30 : num / den;
-            }
-        }
+        double s = std::tan(param * 0.5);
 
         double Q = A_e_ + C_e_ * s * s;
         double x2d, y2d;
