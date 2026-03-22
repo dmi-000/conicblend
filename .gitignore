@@ -1,0 +1,28 @@
+# Build output
+build/
+*.o
+*.d
+
+# Compiled binaries
+demo
+demo_nd
+demo_conic
+demo_conic_dbg
+demo_conic_llvm
+demo_conic20
+demo_nd20
+
+# macOS
+.DS_Store
+
+# Session / scratch files
+*.txt
+!CMakeLists.txt
+*.btw
+*.compact
+*.csv
+*.png
+
+# Python cache
+__pycache__/
+*.pyc
