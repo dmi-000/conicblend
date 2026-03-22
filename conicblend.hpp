@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <variant>
 
 
 namespace fc {
@@ -928,18 +929,60 @@ private:
     }
 };
 
+// ── LagrangeWindow: per-window fallback for invalid ConicWindows ────────────
+//
+// Degree-4 Lagrange polynomial interpolant through 5 control points.
+// Used in place of a ConicWindow when the conic fit fails (degenerate
+// geometry, non-monotone cross-ratio, etc.).
+//
+// Always valid(); evaluation is O(25) multiplications per call.
+// C^∞ within its parameter range; C^N at junctions because each junction
+// is covered by exactly one window used identically from both adjacent segments.
+
+template <int Dim>
+struct LagrangeWindow {
+    VecN<Dim> pts_[5];
+    double    ts_[5];
+
+    LagrangeWindow() = default;
+
+    LagrangeWindow(VecN<Dim> const& p0, VecN<Dim> const& p1,
+                   VecN<Dim> const& p2, VecN<Dim> const& p3,
+                   VecN<Dim> const& p4,
+                   double t0, double t1, double t2, double t3, double t4)
+    {
+        pts_[0]=p0; pts_[1]=p1; pts_[2]=p2; pts_[3]=p3; pts_[4]=p4;
+        ts_[0]=t0;  ts_[1]=t1;  ts_[2]=t2;  ts_[3]=t3;  ts_[4]=t4;
+    }
+
+    bool valid()        const { return true; }
+    bool uses_c_infty() const { return true; }
+
+    VecN<Dim> operator()(double t) const {
+        VecN<Dim> r{};
+        for (int i = 0; i < 5; ++i) {
+            double L = 1.0;
+            for (int j = 0; j < 5; ++j)
+                if (j != i) L *= (t - ts_[j]) / (ts_[i] - ts_[j]);
+            r = r + pts_[i] * L;
+        }
+        return r;
+    }
+};
+
 // ── Tagged overload: blend_curve(..., conic_tag{}) ─────────────────────────
 //
 // Builds ConicWindow objects for each group of 5 consecutive control points.
-// If ALL windows are valid, uses 5-point conic blending.
-// If ANY window is invalid, falls back to circle windows (blend_curve with circle_tag).
+// Valid windows use the conic cross-ratio parametrisation; invalid windows
+// fall back to a LagrangeWindow (degree-4 polynomial) for that window only.
+// No global fallback: a local invalidity has only local effect.
 //
 // Minimum control points: 6  (gives 1 blended segment j=2).
 // Blended segments: j = 2, …, n-4.
 // At junction times[j]: both adjacent segments use win[j-2] → C^N continuity.
 //
-// used_conic (optional out-parameter): set to true if conic windows were used,
-// false if the call fell back to circle windows.  Pass nullptr (default) to ignore.
+// used_conic (optional out-parameter): true if at least one conic window was
+// used, false if all windows fell back to Lagrange.  Pass nullptr to ignore.
 
 template <int Dim>
 inline BlendResultND<Dim> blend_curve(
@@ -964,20 +1007,32 @@ inline BlendResultND<Dim> blend_curve(
     if (pts_per_seg < 2)
         FC_THROW("fc::blend_curve(conic): pts_per_seg must be >= 2");
 
-    // Build (n-4) conic windows: win[i] covers ctrl[i..i+4]
-    std::vector<ConicWindow<Dim>> wins;
+    // Build (n-4) windows: ConicWindow where valid, LagrangeWindow otherwise.
+    // Per-window fallback: invalidity is local — no global effect on other windows.
+    using Win = std::variant<ConicWindow<Dim>, LagrangeWindow<Dim>>;
+    std::vector<Win> wins;
     wins.reserve(n - 4);
+    int n_conic = 0;
+
     for (int i = 0; i < n-4; ++i) {
-        wins.emplace_back(ctrl[i], ctrl[i+1], ctrl[i+2], ctrl[i+3], ctrl[i+4],
-                          times[i], times[i+1], times[i+2], times[i+3], times[i+4],
-                          allow_cross_branch);
-        if (!wins.back().valid()) {
-            // Fall back to circle windows for entire curve
-            if (used_conic) *used_conic = false;
-            return blend_curve<Dim>(ctrl, times, circle_tag{}, pts_per_seg, smooth_N);
+        ConicWindow<Dim> cw(ctrl[i], ctrl[i+1], ctrl[i+2], ctrl[i+3], ctrl[i+4],
+                            times[i], times[i+1], times[i+2], times[i+3], times[i+4],
+                            allow_cross_branch);
+        if (cw.valid()) {
+            ++n_conic;
+            wins.emplace_back(std::move(cw));
+        } else {
+            wins.emplace_back(LagrangeWindow<Dim>(
+                ctrl[i], ctrl[i+1], ctrl[i+2], ctrl[i+3], ctrl[i+4],
+                times[i], times[i+1], times[i+2], times[i+3], times[i+4]));
         }
     }
-    if (used_conic) *used_conic = true;
+    if (used_conic) *used_conic = (n_conic > 0);
+
+    // Evaluate any window type through std::visit.
+    auto eval_win = [](Win const& w, double t) -> VecN<Dim> {
+        return std::visit([t](auto const& ww) -> VecN<Dim> { return ww(t); }, w);
+    };
 
     // Blend: segment j runs from times[j] to times[j+1], j=2..n-4
     // Uses win[j-2] (w=0 side) and win[j-1] (w=1 side)
@@ -989,8 +1044,8 @@ inline BlendResultND<Dim> blend_curve(
     out.times.reserve(n_segs * pts_per_seg + 1);
 
     for (int j = 2; j <= n-4; ++j) {
-        ConicWindow<Dim> const& wA = wins[j-2];
-        ConicWindow<Dim> const& wB = wins[j-1];
+        Win const& wA = wins[j-2];
+        Win const& wB = wins[j-1];
         double t_lo = times[j], t_hi = times[j+1];
 
         int k_max = (j < n-4) ? pts_per_seg - 1 : pts_per_seg;
@@ -998,7 +1053,7 @@ inline BlendResultND<Dim> blend_curve(
             double s = static_cast<double>(k) / pts_per_seg;
             double t = t_lo + s * (t_hi - t_lo);
             double w = smoothstep(s, smooth_N);
-            VecN<Dim> A = wA(t), B = wB(t);
+            VecN<Dim> A = eval_win(wA, t), B = eval_win(wB, t);
             out.pts.push_back(A*(1.0-w) + B*w);
             out.times.push_back(t);
         }
