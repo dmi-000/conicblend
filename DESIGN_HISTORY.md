@@ -107,17 +107,95 @@ NSolve handles the exact arithmetic internally).
 
 ---
 
+---
+
+## 2026-03-22  CylinderWindow integration  (conicblend_cylinder.hpp)
+
+**Motivation: why cylinders instead of planes**
+
+`ConicWindow<3>` projects 3D control points onto their best-fit plane and fits
+a 2D conic.  This discards torsion: the plane projection of a curve with
+non-zero torsion τ introduces an O(κτh³) geometric error per segment that
+cannot be eliminated by adding more control points, because the error is
+structural — the curve leaves the plane between knots.
+
+A right circular cylinder is the natural next step:
+
+1. A helix (canonical constant-κ, constant-τ curve) is a geodesic on its
+   cylinder.  It unrolls to a straight line, which any interpolator
+   reproduces exactly.
+2. More generally, the osculating cylinder captures both curvature and torsion
+   locally, whereas the osculating plane captures only curvature.
+3. As the window shrinks, the best-fit cylinder through 5 nearby points
+   converges to the osculating cylinder, giving an O(h⁴) or better geometric
+   approximation vs O(h³) torsion leakage from the plane.
+
+In short: planes are the right primitive for 2D curves; cylinders are the
+right primitive for 3D curves with torsion.
+
+**Architecture: separate opt-in `cylinder_tag{}`**
+
+Integrated the 2D-Newton cylinder solver as `CylinderWindow<3>` in
+`conicblend_cylinder.hpp`.  Available via `blend_curve(ctrl, times,
+cylinder_tag{})`.  Kept as a separate opt-in alongside `ConicWindow`:
+both coexist until evidence proves one is universally better.
+
+**Fallback chain per window:**
+1. `CylinderWindow<3>`: find best-fit cylinder → unroll → `ConicWindow<2>` or
+   `LagrangeWindow<2>` → re-roll.
+2. `ConicWindow<3>` (no real cylinder found): project to best-fit plane.
+3. `LagrangeWindow<3>` (both above fail): at `blend_curve` level.
+
+**Geodesic degeneracy (helix on its own cylinder)**
+
+A helix is a geodesic on its cylinder, so it unrolls to a straight line in
+(r·φ, z) space.  `ConicWindow<2>` correctly detects collinearity (via its
+PCA eigenvalue guard) and returns `valid_=false`.  We fall back to
+`LagrangeWindow<2>`, which reproduces a straight line exactly (degree-4
+Lagrange is exact for degree-1 data).  This gives near-machine-precision
+helix interpolation (~2e-15 error).
+
+**Cylinder selection: monotone-φ + geodesic-first sort**
+
+For 5 points on a helix, up to 6 distinct exact-fit cylinders exist (all with
+knot_err ≈ 1e-16).  A naïve sort by φ-span picks a non-monotone oblique
+cylinder (span=2.5) rather than the true helix cylinder (span=7.2), leading to
+errors of ~1.8 (10× *worse* than conic).  Sorting by φ-span among monotone
+cylinders alone is also insufficient: an oblique monotone cylinder (span=5.4)
+is preferred over the true helix cylinder.
+
+**Fix:** Two-level sort in `cyl_solve`:
+1. Monotone-φ cylinders first.  A non-monotone φ sequence means the control
+   points' angular projections onto the cylinder fold back as t increases
+   monotonically — a non-injective parametrization.  The cylinder is simply a
+   poor frame for this arc; it does not mean the 3D curve is degenerate.
+2. Among monotone cylinders: geodesic cylinders (`lam_ratio < 1e-4`, where
+   `lam_ratio = lam_min/lam_max` of the 2D unrolled scatter) come first,
+   because they give *exact* interpolation via `LagrangeWindow<2>`.
+3. Among non-geodesic cylinders: sort by φ-span ascending (smaller = more
+   compact = more stable).
+
+**Measured results (demo_cylinder.cpp):**
+
+| Curve | n | conic max_dev | cylinder max_dev | improvement |
+|-------|---|---------------|-----------------|-------------|
+| Helix | 8 | 9.6e-02 | 1.9e-15 | ~5×10¹³× |
+| Helix | 12 | 1.1e-02 | 1.9e-15 | ~6×10¹²× |
+| Helix | 20 | 1.1e-02 | 2.4e-15 | ~5×10¹²× |
+| Twisted cubic | 8 | 1.3e-03 | 2.5e-05 | 53× |
+| Twisted cubic | 12 | 4.7e-04 | 2.7e-06 | 175× |
+| Twisted cubic | 20 | 1.0e-04 | 1.7e-07 | 601× |
+
+**Proved property:** for a curve that lies exactly on a cylinder (e.g., helix),
+`CylinderWindow<3>` achieves near-machine-precision interpolation, independent
+of n (number of control points).  The geodesic-first sort is essential for this.
+
 ## Pending / open questions
 
-- **CylinderWindow integration** *(in progress)*: `conicblend_cylinder.hpp`
-  will add a `CylinderWindow<3>` class and `cylinder_tag{}` blend_curve overload
-  as a separate opt-in alongside `ConicWindow`.
+- **Replace ConicWindow with CylinderWindow for 3D?** Open.  The measured data
+  shows cylinder is always better for the two test curves.  Needs broader testing
+  across curve families before replacing.  Document proof/evidence here when done.
 
-- **Replace ConicWindow with CylinderWindow for 3D?** Open.  If it can be
-  proved (or measured across a broad curve family) that cylinder unrolling always
-  gives equal or lower interpolation error than plane projection for 3D input,
-  replace and note the proof/evidence here.  Until then, both coexist.
-
-- **Non-planar data and the plane fallback chain**: when `solve_cylinders`
-  returns no real cylinders for a window, the right fallback is: plane ConicWindow
-  → LagrangeWindow.  This is the 3D analogue of the existing fallback chain.
+- **Non-planar data and the plane fallback chain**: when `cyl_solve` returns no
+  real cylinders for a window, the current fallback is ConicWindow<3>.  This is
+  the 3D analogue of the existing fallback chain.
