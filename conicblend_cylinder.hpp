@@ -2,14 +2,20 @@
 // Header-only C++17 library.  Requires conicblend.hpp.
 //
 // Architecture:
-//   Each 5-point window finds the best-fitting right circular cylinder through
-//   the 5 control points (smallest Δφ arc span), unrolls them to (r·φ, z), fits
-//   a 2D ConicWindow there, and re-rolls the result back to 3D.
+//   Each 5-point window tries all real cylinders through the 5 control points
+//   in sorted order (geodesic first, then phi_span ascending).  For each,
+//   ConicWindow<2> is attempted on the unrolled (r·φ, z) control points:
+//     - geodesic (lam_ratio < 1e-4): unrolled pts are near-collinear → ConicWindow<2>
+//       uses its internal line mode (degree-4 Lagrange) — machine-precision for helices.
+//     - non-geodesic: ConicWindow<2> uses the standard conic rational map.
+//   If ConicWindow<2> rejects (degenerate conic, non-monotone arc-angle), the next
+//   cylinder is tried.  The re-rolled result is the final 3D curve for this window.
 //
 //   Fallback chain per window:
-//     CylinderWindow (cylinder found, 2D conic valid)
-//     → ConicWindow<3> (no real cylinder, project to best-fit plane)
-//     → LagrangeWindow<3> (conic also invalid; used by blend_curve level)
+//     Exact-fit cylinder + ConicWindow<2>     (5 pts exactly on cylinder)
+//     → Best-fit cylinder + ConicWindow<2>    (only if max surface residual < 5% of
+//                                              window scale; grid search on S²)
+//     → LagrangeWindow<3>                     (both fail; used by blend_curve level)
 //
 //   The cylinder solver uses 2D Newton on G(a,c)=0, H(a,c)=0 from a 40×40
 //   sinh-spaced starting grid (3 axis permutations).  Avoids the Sylvester
@@ -312,14 +318,19 @@ static inline std::vector<CylSol> cyl_solve(const VecN<3> pts5[5])
             if (!dup) all.push_back(cs);
         }
     }
-    // Sort: monotone-phi first.  A non-monotone phi sequence means the control
-    // points' angular projections fold back as t increases — the cylinder is a
-    // non-injective frame for this arc.  Within monotone, geodesic cylinders
-    // (lam_ratio < 1e-4 → near-collinear unrolled points, e.g. helix on its
-    // own cylinder) come first because they give exact Lagrange interpolation.
-    // Among non-geodesic cylinders, sort by phi_span (smaller = more compact).
+    // Sort: geodesic cylinders (lam_ratio < 1e-4 → unrolled points near-collinear,
+    // e.g. helix on its own cylinder) first — ConicWindow<2> uses line mode for
+    // these, giving machine-precision interpolation.
+    // Among non-geodesic cylinders, sort by phi_span ascending (smaller = more
+    // compact = more numerically stable conic fit).
+    //
+    // phi_monotone is NOT used as a sort key here.  It correctly guards
+    // LagrangeWindow<2> (a non-monotone r·φ(t) signal makes Lagrange oscillate),
+    // but it is the wrong gate for ConicWindow<2>, which only requires that the
+    // conic arc-angle from P₀ is monotone — a strictly weaker condition that
+    // ConicWindow<2> checks internally.  CylinderWindow iterates through this
+    // sorted list and lets ConicWindow<2>'s own validity test decide.
     std::sort(all.begin(),all.end(),[](const CylSol&a,const CylSol&b){
-        if (a.phi_monotone != b.phi_monotone) return a.phi_monotone > b.phi_monotone;
         bool ag = (a.lam_ratio < 1e-4), bg = (b.lam_ratio < 1e-4);
         if (ag != bg) return ag > bg;
         if (ag && bg) return a.lam_ratio < b.lam_ratio;
@@ -328,34 +339,168 @@ static inline std::vector<CylSol> cyl_solve(const VecN<3> pts5[5])
     return all;
 }
 
+// ── Best-fit right circular cylinder ─────────────────────────────────────
+// Minimise Σ(dist(pᵢ,axis) − r)² with r = mean dist (eliminated analytically).
+// Axis direction u searched over S² on a 20×20 grid; for each u the optimal
+// centre and r are found via Coope's algebraic circle fit (LS on the linear
+// system a·xᵢ + b·yᵢ + c = xᵢ²+yᵢ²) applied to the 2D projections ⊥ u.
+//
+// Returns the best (u, centre, r) found, plus max_surf_res = normalised max
+// surface residual max(|dist(pᵢ,axis)−r|) / win_scale.  Caller gates on this.
+
+struct CylBFSol {
+    VecN<3> u_hat, v_hat, w_hat, offset;
+    double  r, max_surf_res;  // max_surf_res dimensionless; 1e30 if degenerate
+};
+
+static inline CylBFSol cyl_best_fit(const VecN<3> pts5[5], double win_scale)
+{
+    CylBFSol best;
+    best.max_surf_res = 1e30;
+
+    auto try_u = [&](VecN<3> u) {
+        double un = u.norm();
+        if (un < 1e-10) return;
+        u = u * (1.0 / un);
+
+        // Perpendicular basis
+        VecN<3> e1 = (std::abs(u[0]) < 0.9) ? VecN<3>{1,0,0} : VecN<3>{0,1,0};
+        e1 = e1 - u * e1.dot(u);
+        double e1n = e1.norm();
+        if (e1n < 1e-10) return;
+        e1 = e1 * (1.0 / e1n);
+        VecN<3> e2 = cyl_cross3(u, e1);
+
+        // Project 5 points to 2D plane ⊥ u
+        double px[5], py[5];
+        for (int i = 0; i < 5; ++i) {
+            px[i] = pts5[i].dot(e1);
+            py[i] = pts5[i].dot(e2);
+        }
+
+        // Coope's algebraic circle fit: solve a·xᵢ + b·yᵢ + c = zᵢ (LS) where
+        // zᵢ = xᵢ²+yᵢ².  Center = (a/2, b/2), r² = c + cx²+cy².
+        // This minimises Σ(algebraic distance)² and gives the correct circle for
+        // exact data; it does NOT minimise Σ(dᵢ−r̄)² but is an excellent proxy
+        // and far cheaper than a geometric iteration.
+        double M[3][3]={}, rhs[3]={};
+        for (int i = 0; i < 5; ++i) {
+            double x=px[i], y=py[i], z=x*x+y*y;
+            M[0][0]+=x*x; M[0][1]+=x*y; M[0][2]+=x;
+            M[1][0]+=x*y; M[1][1]+=y*y; M[1][2]+=y;
+            M[2][0]+=x;   M[2][1]+=y;   M[2][2]+=1;
+            rhs[0]+=z*x;  rhs[1]+=z*y;  rhs[2]+=z;
+        }
+        // 3×3 Gaussian elimination (no pivoting; well-conditioned for spread pts)
+        double sol[3]={rhs[0],rhs[1],rhs[2]};
+        for (int col = 0; col < 3; ++col) {
+            if (std::abs(M[col][col]) < 1e-30) return;   // degenerate
+            for (int row = col+1; row < 3; ++row) {
+                double f = M[row][col] / M[col][col];
+                for (int k = col; k < 3; ++k) M[row][k] -= f * M[col][k];
+                sol[row] -= f * sol[col];
+            }
+        }
+        // Back substitution
+        for (int row = 2; row >= 0; --row) {
+            for (int k = row+1; k < 3; ++k) sol[row] -= M[row][k] * sol[k];
+            sol[row] /= M[row][row];
+        }
+        double cx = sol[0]*0.5, cy = sol[1]*0.5;
+        double rsq = sol[2] + cx*cx + cy*cy;
+        if (rsq <= 0.0) return;
+        double r = std::sqrt(rsq);
+        if (r < 1e-10) return;
+
+        // Max surface residual (normalised)
+        double maxres = 0;
+        for (int i = 0; i < 5; ++i) {
+            double d = std::sqrt((px[i]-cx)*(px[i]-cx) + (py[i]-cy)*(py[i]-cy));
+            double res = std::abs(d - r);
+            if (res > maxres) maxres = res;
+        }
+        double rel = (win_scale > 0) ? maxres / win_scale : maxres;
+        if (rel < best.max_surf_res) {
+            best.max_surf_res = rel;
+            best.r      = r;
+            best.u_hat  = u;
+            best.v_hat  = e1;
+            best.w_hat  = e2;
+            best.offset = e1 * cx + e2 * cy;   // point on axis with zero u-component
+        }
+    };
+
+    // Grid search on S²
+    const int NT = 20, NP = 20;
+    for (int it = 0; it < NT; ++it) {
+        double theta = M_PI * (it + 0.5) / NT;
+        double st = std::sin(theta), ct = std::cos(theta);
+        for (int ip = 0; ip < NP; ++ip) {
+            double phi = 2.0 * M_PI * ip / NP;
+            try_u(VecN<3>{st*std::cos(phi), st*std::sin(phi), ct});
+        }
+    }
+    // Axis-aligned extras
+    for (auto ax : std::initializer_list<VecN<3>>{{1,0,0},{0,1,0},{0,0,1}})
+        try_u(ax);
+
+    return best;
+}
+
 } // namespace detail
 
 // ── CylinderWindow<3> ─────────────────────────────────────────────────────
 //
-// Fits a right circular cylinder through 5 control points (smallest Δφ),
-// unrolls to (r·φ, z), and applies a 2D ConicWindow there.
-// Falls back to ConicWindow<3> if no real cylinder is found.
-// valid() is false only if both paths fail → blend_curve uses LagrangeWindow.
+// Fits a cylinder through 5 control points, unrolls to (r·φ, z), and applies
+// ConicWindow<2> there.  Fallback chain:
+//   1. Exact-fit cylinder (Newton solver) + ConicWindow<2>
+//   2. Best-fit cylinder (grid search on S²) + ConicWindow<2>,
+//      only if max surface residual < 5% of window scale
+//   3. Caller falls back to LagrangeWindow<3> (valid() == false)
 
 template <int Dim>
 class CylinderWindow;   // defined only for Dim=3
 
 template <>
 class CylinderWindow<3> {
-    bool valid_       = false;
-    bool use_cylinder_= false;
+    bool valid_        = false;
+    bool use_best_fit_ = false;   // true → level 2 (best-fit) was used
 
-    // Cylinder path: geometry for re-rolling + inner 2D window
-    // When the unrolled points are near-collinear (e.g. helix), ConicWindow<2>
-    // fails its collinearity check; we fall back to LagrangeWindow<2> in the
-    // cylinder frame, which reproduces geodesics (e.g. helix) exactly.
     VecN<3> u_hat_{}, v_hat_{}, w_hat_{}, offset_{};
     double  r_ = 0.0;
-    using Inner2D = std::variant<ConicWindow<2>, LagrangeWindow<2>>;
+    using Inner2D = ConicWindow<2>;
     Inner2D inner_2d_;
 
-    // Fallback path: plane-projected conic (when no real cylinder found)
-    ConicWindow<3> conic3d_;
+    // Shared helper: unroll pts5 onto a cylinder (u_hat, v_hat, w_hat, offset, r)
+    // and attempt ConicWindow<2>.  Fills members and returns true on success.
+    bool try_cylinder_(const VecN<3> pts5[5],
+                       VecN<3> const& u, VecN<3> const& v, VecN<3> const& w,
+                       VecN<3> const& off, double r,
+                       double t0, double t1, double t2, double t3, double t4)
+    {
+        VecN<2> upts[5];
+        double phi[5];
+        for (int k = 0; k < 5; ++k) {
+            VecN<3> p  = pts5[k] - off;
+            VecN<3> pp = p - u * p.dot(u);
+            phi[k] = std::atan2(pp.dot(w), pp.dot(v));
+        }
+        for (int k = 1; k < 5; ++k) {
+            double dv = phi[k] - phi[k-1];
+            while (dv >  M_PI) { dv -= 2*M_PI; phi[k] -= 2*M_PI; }
+            while (dv < -M_PI) { dv += 2*M_PI; phi[k] += 2*M_PI; }
+        }
+        for (int k = 0; k < 5; ++k) {
+            double z = (pts5[k] - off).dot(u);
+            upts[k] = VecN<2>{r * phi[k], z};
+        }
+        Inner2D win(upts[0],upts[1],upts[2],upts[3],upts[4],
+                    t0,t1,t2,t3,t4);
+        if (!win.valid()) return false;
+        u_hat_ = u; v_hat_ = v; w_hat_ = w; offset_ = off; r_ = r;
+        inner_2d_ = std::move(win);
+        return true;
+    }
 
 public:
     CylinderWindow() = default;
@@ -364,71 +509,52 @@ public:
                    VecN<3> const& p3, VecN<3> const& p4,
                    double t0, double t1, double t2, double t3, double t4)
     {
-        VecN<3> pts5[5]={p0,p1,p2,p3,p4};
+        VecN<3> pts5[5] = {p0,p1,p2,p3,p4};
 
-        // ── Try cylinder path ──────────────────────────────────────────────
+        // ── Level 1: exact-fit cylinders (Newton solver) ─────────────────
+        // Sorted: geodesic first, then phi_span ascending.
+        // ConicWindow<2> handles both line-mode (geodesic) and conic cases.
         auto cyls = detail::cyl_solve(pts5);
-        if (!cyls.empty()) {
-            auto& cs = cyls[0];  // smallest phi_span
-
-            u_hat_ = cs.u_hat; v_hat_ = cs.v_hat;
-            w_hat_ = cs.w_hat; offset_ = cs.offset; r_ = cs.r;
-
-            // Unroll 5 control points to (r·φ, z)
-            VecN<2> upts[5];
-            double phi[5];
-            for (int k=0;k<5;++k) {
-                VecN<3> p = pts5[k] - offset_;
-                VecN<3> pp = p - u_hat_*p.dot(u_hat_);
-                phi[k] = std::atan2(pp.dot(w_hat_), pp.dot(v_hat_));
+        for (auto& cs : cyls) {
+            if (try_cylinder_(pts5, cs.u_hat, cs.v_hat, cs.w_hat, cs.offset, cs.r,
+                              t0,t1,t2,t3,t4)) {
+                valid_ = true;
+                return;
             }
-            for (int k=1;k<5;++k) {    // unwrap
-                double dv=phi[k]-phi[k-1];
-                while(dv> M_PI){dv-=2*M_PI; phi[k]-=2*M_PI;}
-                while(dv<-M_PI){dv+=2*M_PI; phi[k]+=2*M_PI;}
-            }
-            for (int k=0;k<5;++k) {
-                double z = (pts5[k]-offset_).dot(u_hat_);
-                upts[k] = VecN<2>{r_*phi[k], z};
-            }
-
-            // Try 2D conic; if unrolled points are near-collinear (e.g. helix
-            // is a geodesic → straight line after unrolling), fall back to
-            // Lagrange<2> which reproduces a line exactly via polynomial interp.
-            ConicWindow<2> cw2(upts[0],upts[1],upts[2],upts[3],upts[4],
-                               t0,t1,t2,t3,t4);
-            if (cw2.valid()) {
-                inner_2d_ = std::move(cw2);
-            } else {
-                inner_2d_ = LagrangeWindow<2>(upts[0],upts[1],upts[2],upts[3],upts[4],
-                                              t0,t1,t2,t3,t4);
-            }
-            use_cylinder_ = true;
-            valid_ = true;
-            return;
         }
 
-        // ── Fallback: ConicWindow<3> on best-fit plane ────────────────────
-        conic3d_ = ConicWindow<3>(p0,p1,p2,p3,p4, t0,t1,t2,t3,t4);
-        if (conic3d_.valid()) {
-            valid_ = true;
+        // ── Level 2: best-fit cylinder ────────────────────────────────────
+        // Gate: only proceed if max surface residual < 5% of window scale.
+        // Invariant: residual/win_scale is dimensionless, rigid-motion invariant.
+        double win_scale = 0.0;
+        for (int i = 0; i < 5; ++i)
+            for (int j = i+1; j < 5; ++j)
+                win_scale = std::max(win_scale, (pts5[i]-pts5[j]).norm());
+
+        auto bf = detail::cyl_best_fit(pts5, win_scale);
+        if (bf.max_surf_res < 5e-2) {
+            if (try_cylinder_(pts5, bf.u_hat, bf.v_hat, bf.w_hat, bf.offset, bf.r,
+                              t0,t1,t2,t3,t4)) {
+                use_best_fit_ = true;
+                valid_        = true;
+                return;
+            }
         }
+        // valid_ stays false → blend_curve falls back to LagrangeWindow<3>
     }
 
-    bool valid()         const { return valid_; }
-    bool used_cylinder() const { return use_cylinder_; }
+    bool valid()          const { return valid_; }
+    bool used_cylinder()  const { return valid_; }   // always true when valid
+    bool used_best_fit()  const { return use_best_fit_; }
 
     VecN<3> operator()(double t) const {
-        if (use_cylinder_) {
-            VecN<2> uv = std::visit([t](auto const& w) { return w(t); }, inner_2d_);
-            double phi = uv[0] / r_;
-            double z   = uv[1];
-            return offset_
-                 + u_hat_ * z
-                 + v_hat_ * (r_ * std::cos(phi))
-                 + w_hat_ * (r_ * std::sin(phi));
-        }
-        return conic3d_(t);
+        VecN<2> uv  = inner_2d_(t);
+        double  phi = uv[0] / r_;
+        double  z   = uv[1];
+        return offset_
+             + u_hat_ * z
+             + v_hat_ * (r_ * std::cos(phi))
+             + w_hat_ * (r_ * std::sin(phi));
     }
 };
 

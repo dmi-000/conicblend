@@ -333,7 +333,7 @@ Test results unchanged: helix ~5×10⁻¹⁶, twisted cubic 47–601×.
 
 ---
 
-## 2026-03-23  Fallback chain redesign (design decision, not yet implemented)
+## 2026-03-23  Fallback chain redesign (design decision)
 
 **Problem with ConicWindow<3> as fallback:**
 
@@ -369,25 +369,43 @@ most principled such criterion.  `phi_span` (angular span of the 5 points on the
 cylinder) is a weaker proxy.  The current implementation uses phi_span; the orbit
 reconstruction error should be exposed as a `fit_error()` accessor and used instead.
 
-**Designed (not yet implemented) fallback chain:**
+**Implemented fallback chain (2026-03-23):**
 
 ```
 Exact-fit cylinder + ConicWindow<2>         (Newton converged, ConicWindow accepted)
-  → Best-fit cylinder + ConicWindow<2>      (only if cylinder surface residuals small)
+  → Best-fit cylinder + ConicWindow<2>      (only if max surface residual < 5% of
+                                             window scale; grid search on S²)
     → LagrangeWindow<3>                     (no cylindrical structure in the data)
 ```
 
-`ConicWindow<3>` is removed from the chain — it was never geometrically justified as a
+`ConicWindow<3>` removed from the chain — it was never geometrically justified as a
 fallback, only present as a historical pre-cylinder code path.
 
-Best-fit cylinder: minimise Σ(dist(pᵢ, axis) − r)² over axis direction, axis point,
-and radius r.  Always has a solution.  Fires only when `cyl_solve` Newton fails.
-Needs a residual gate: if max(|dist(pᵢ, axis) − r|) > ε · window_scale, the data
-has no cylindrical structure → fall through to LagrangeWindow<3>.
+**Best-fit cylinder implementation**: grid search over S² (20×20 axis directions
+plus the three axis-aligned directions); for each direction u, project 5 points
+to the plane ⊥ u and run **Coope's algebraic circle fit** — solving the linear LS
+system a·xᵢ + b·yᵢ + c = xᵢ²+yᵢ² (3×3 normal equations) — to find the optimal
+circle centre (a/2, b/2) and radius r = √(c + cx² + cy²).  This minimises the
+sum of squared algebraic distances to the circle, which is an excellent proxy for
+geometric residuals and requires no iteration.
+
+Note: an earlier prototype used Weiszfeld's iterative re-weighted centroid; this
+was replaced because Weiszfeld minimises Σ dist_i (geometric median), not
+Σ(dist_i − r̄)² (circle residuals), giving wrong answers for the axis-recovery
+test (helix dot product dropped from 1.000 to 0.233).  Coope's LS is both correct
+and non-iterative.
+
+Dimensionless gate: max(|dist(pᵢ,axis)−r|) / win_scale < 5e-2,
+where win_scale = max pairwise distance of the 5 points.
+
+**`fit_error()` on ConicWindow<2>** (2026-03-23): exposes the orbit reconstruction
+error, normalised by win_scale — dimensionless and rigid-motion + scale invariant.
+The existing absolute-units gate (> 1e-3) was replaced by the same gate on the
+normalised error.
 
 The convex-hull failure mode (one point in the convex hull of the other 4) causes
 large residuals in both exact-fit and best-fit, so it exits to LagrangeWindow<3>
-at both levels — which is the correct answer (no meaningful cylinder frame exists).
+at both levels — the correct answer (no meaningful cylinder frame exists).
 
 ---
 
@@ -397,11 +415,16 @@ at both levels — which is the correct answer (no meaningful cylinder frame exi
   shows cylinder is always better for the two test curves.  Needs broader testing
   across curve families before replacing.  Document proof/evidence here when done.
 
-- **Implement best-fit cylinder fallback**: replace the current ConicWindow<3>
-  fallback with best-fit cylinder + residual gate + LagrangeWindow<3>.  Requires
-  a 5-parameter nonlinear least-squares solver (Gauss-Newton or LM) on the
-  cylinder surface distance function.
+- **Use fit_error() to select among multiple exact-fit cylinders**: currently the
+  cylinder sort key is (geodesic-first, then phi_span ascending).  phi_span is a
+  proxy; the orbit reconstruction error from ConicWindow<2>.fit_error() is the
+  principled invariant criterion.  Open: measure whether resorting on fit_error
+  changes which cylinder wins in practice.
 
-- **Expose ConicWindow<2> orbit reconstruction error**: add `fit_error()` accessor
-  and use it to select among multiple accepted cylinders (minimum error wins)
-  instead of phi_span.
+- **Best-fit cylinder path not yet exercised by test suite**: `test_cylinder_edge.cpp`
+  covers all other code paths (exact-fit, line mode, coplanar fallback, axis recovery,
+  gate, tilted cylinder, regression).  Triggering `used_best_fit()=true` requires a
+  configuration where every exact-fit cylinder's ConicWindow<2> is invalid (non-monotone
+  φ, high fit_error) but the grid-search best-fit cylinder passes both the 5e-2 gate
+  and ConicWindow<2>.  Such a configuration was not found analytically; the path is
+  covered indirectly by T6 (cyl_best_fit unit) and T7 (gate fires correctly).

@@ -504,8 +504,21 @@ class ConicWindow {
     bool use_lagrange_;
     double ts_[5];   // control times (for range queries)
 
+    // Line mode: collinear input is a valid degenerate conic (a straight line).
+    // When active, eval_at_ uses degree-4 Lagrange in the plane instead of the
+    // rational conic map.
+    bool   line_mode_;
+    double line_x_[5], line_y_[5];
+
+    // Orbit reconstruction quality: max over the 5 control points of
+    //   |eval(ts[i]) − projected_pt[i]| / win_scale
+    // where win_scale = max pairwise distance of the 2D-projected points.
+    // Dimensionless and invariant under rigid motions and uniform scaling.
+    // 0.0 in line mode (degree-4 Lagrange interpolates exactly).
+    double fit_error_;
+
 public:
-    ConicWindow() : valid_(false) {}
+    ConicWindow() : valid_(false), line_mode_(false), fit_error_(0.0) {}
 
     // allow_cross_branch: if true, windows that span two hyperbola branches are
     // accepted using φ = 2·arctan(s) with unwrapping (projective arc through ∞).
@@ -546,8 +559,18 @@ public:
             double tr=sxx+syy, dsc=(sxx-syy)*(sxx-syy)+4*sxy*sxy;
             double lam_min = 0.5*(tr - std::sqrt(dsc));
             double lam_max = 0.5*(tr + std::sqrt(dsc));
-            if (lam_max < 1e-30 || lam_min < 1e-4 * lam_max)
-                return;  // collinear projected points → degenerate
+            if (lam_max < 1e-30 || lam_min < 1e-4 * lam_max) {
+                // Straight line: a valid degenerate conic — monotone by definition.
+                // Store 2D projections; eval_at_ will use degree-4 Lagrange.
+                for (int i = 0; i < 5; ++i) {
+                    line_x_[i] = pts2d[i][0];
+                    line_y_[i] = pts2d[i][1];
+                }
+                line_mode_  = true;
+                fit_error_  = 0.0;   // degree-4 Lagrange interpolates exactly
+                valid_      = true;
+                return;
+            }
         }
 
         // 2. Fit conic coefficients [A,B,C,D,E,F]
@@ -813,6 +836,18 @@ public:
         // the plane projections (center_ + pts2d[i][0]*e1_ + pts2d[i][1]*e2_), NOT
         // the original nD pts5[i].  For a non-planar curve (helix, torus, …) pts5[i]
         // has a planarity residual ⊥ to the plane that the orbit can never reproduce.
+        //
+        // Normalise by win_scale = max pairwise distance of the 2D-projected points
+        // so the threshold is dimensionless and invariant under rigid motions + scaling.
+        double wsq = 0.0;
+        for (int i = 0; i < 5; ++i)
+            for (int j = i+1; j < 5; ++j) {
+                double dx = pts2d[i][0]-pts2d[j][0], dy = pts2d[i][1]-pts2d[j][1];
+                double d2 = dx*dx + dy*dy;
+                if (d2 > wsq) wsq = d2;
+            }
+        double win_scale = std::sqrt(wsq);
+
         double max_err = 0.0;
         for (int i = 0; i < 5; ++i) {
             VecN<Dim> pred     = eval_at_(ts_[i]);
@@ -820,13 +855,15 @@ public:
             double err = (pred - proj_pt).norm();
             if (err > max_err) max_err = err;
         }
-        if (max_err > 1e-3) return;  // conic orbit doesn't reconstruct projected control points
+        fit_error_ = (win_scale > 0.0) ? max_err / win_scale : 0.0;
+        if (fit_error_ > 1e-3) return;  // conic orbit doesn't reconstruct projected control points
 
         valid_ = true;
     }
 
-    bool valid()        const { return valid_; }
-    bool uses_c_infty() const { return use_lagrange_; }  // true → Lagrange (C^∞ phi)
+    bool   valid()        const { return valid_; }
+    double fit_error()    const { return fit_error_; }   // dimensionless; 0 = exact
+    bool   uses_c_infty() const { return use_lagrange_; }  // true → Lagrange (C^∞ phi)
 
     VecN<Dim> operator()(double t) const { return eval_at_(t); }
 
@@ -838,6 +875,19 @@ private:
     //   u(s) = -(L_e + M_e*s) / (A_e + C_e*s²)
     VecN<Dim> eval_at_(double t) const
     {
+        // Line mode: degenerate conic (collinear input).  Degree-4 Lagrange in 2D.
+        if (line_mode_) {
+            double x = 0.0, y = 0.0;
+            for (int j = 0; j < 5; ++j) {
+                double L = 1.0;
+                for (int k = 0; k < 5; ++k)
+                    if (k != j) L *= (t - ts_[k]) / (ts_[j] - ts_[k]);
+                x += L * line_x_[j];
+                y += L * line_y_[j];
+            }
+            return center_ + x * e1_ + y * e2_;
+        }
+
         // φ = 2·arctan(s) → s = tan(φ/2).  Near φ = ±π the arc crosses ∞ (asymptote).
         double param = use_lagrange_ ? phi_lagrange_.eval(t) : phi_pchip_.eval(t);
         double s = std::tan(param * 0.5);

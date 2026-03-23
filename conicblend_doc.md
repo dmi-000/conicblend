@@ -290,6 +290,84 @@ auto r = fc::blend_curve<4>(ctrl, times, fc::conic_tag{});
 Calling `blend_curve` with `fc::conic_tag{}` without including `conicblend.hpp`
 gives a clear compile error — no silent fallback.
 
+---
+
+### Cylinder windows (`conicblend_cylinder.hpp`)
+
+Requires `conicblend.hpp` (included automatically).
+
+#### Types
+
+```cpp
+struct fc::CylSol {
+    fc::Vec3  u_hat;       // unit axis direction
+    fc::Vec3  v_hat;       // perpendicular in-plane basis vector
+    fc::Vec3  w_hat;       // = u_hat × v_hat
+    fc::Vec3  offset;      // a point on the axis
+    double    r;           // cylinder radius
+    double    phi_span;    // total angular span of the 5 control points (radians)
+    double    knot_err;    // max distance from control points to cylinder surface
+    double    lam_ratio;   // lam_min/lam_max of 2D unrolled scatter;
+                           //   ≈ 0 → points collinear on unroll → geodesic cylinder
+    bool      phi_monotone;// true iff the unrolled φ values are monotone in t
+};
+```
+
+#### Functions
+
+```cpp
+// Find all real right-circular cylinders through exactly 5 points.
+// Algorithm: Lichtblau (2006) axis parametrisation → 2D Newton on bivariate
+//   system (G=0, H=0) — avoids catastrophic cancellation of the Sylvester
+//   resultant in double precision.  Three (x,y,z) permutations cover all
+//   axis orientations.  ~30ms per call.
+// Returned cylinders are sorted: phi_monotone first; then lam_ratio < 1e-4
+//   (geodesic) before non-geodesic; then phi_span ascending.
+std::vector<fc::CylSol> fc::cyl_solve(const fc::Vec3 pts5[5]);
+
+// Build and evaluate the blended curve using 3D cylinder windows.
+// ctrl.size() == times.size() >= 6; times strictly increasing.
+// Blended segments j = 2…n-4; curve passes through ctrl[2]…ctrl[n-3].
+//
+// Fallback chain per window:
+//   1. Exact-fit cylinder (cyl_solve Newton) + ConicWindow<2>
+//        ConicWindow<2> line mode  (unrolled pts collinear → degree-4 Lagrange)
+//        ConicWindow<2> conic mode (general unrolled arc)
+//      → re-roll to 3D
+//   2. Best-fit cylinder (S² grid search, Coope circle fit) + ConicWindow<2>
+//        only if max surface residual / win_scale < 5e-2
+//   3. LagrangeWindow<3>: degree-4 Lagrange in 3D (no cylindrical structure)
+fc::BlendResult fc::blend_curve(
+    std::vector<fc::Vec3> const& ctrl,
+    std::vector<double>   const& times,
+    fc::cylinder_tag{},
+    int pts_per_seg = 60, int smooth_N = 2);
+```
+
+#### Tag dispatch
+
+```cpp
+#include "conicblend_cylinder.hpp"
+
+// Circle windows (3-point):
+auto r = fc::blend_curve(ctrl, times);
+
+// Conic windows (5-point):
+auto r = fc::blend_curve(ctrl, times, fc::conic_tag{});
+
+// Cylinder windows (5-point, 3D only):
+auto r = fc::blend_curve(ctrl, times, fc::cylinder_tag{});
+```
+
+#### When to prefer `cylinder_tag` vs `conic_tag`
+
+| Curve type | Preferred | Reason |
+|---|---|---|
+| Helix, screw, any geodesic-on-cylinder | `cylinder_tag` | Exact to machine precision; conic has O(κτh³) torsion leakage |
+| Twisted cubic or general space curve with torsion | `cylinder_tag` | 53–601× lower error in practice |
+| Planar or near-planar curve | `conic_tag` | No cylinder solve needed; both give similar accuracy |
+| Unknown | `cylinder_tag` | Never observed to be worse than conic on test curves |
+
 #### Embedded / no-exceptions builds
 
 Define `FC_NO_EXCEPTIONS` before including either header to replace all
@@ -541,19 +619,19 @@ gives O(h²) convergence once the angular steps are small.
 
 ## Comparison with conicspline
 
-| Property | conicspline (2D) | conicblend circle | conicblend conic |
-|---|---|---|---|
-| Window size | 5 points | 3 points | 5 points |
-| Window type | Conic arc | Circle arc | Conic arc |
-| Fitting | SVD null-space (5×6) | Cramer's rule (2×2) | SVD null-space (5×6) + best-fit plane |
-| Orbit parameter | phi = 2·arctan(s) | angle via atan2 | cross-ratio r_i = q_i/(q_i+1) |
-| Invariance | similarity | similarity | **affine** (exact); projective (~8e-9 at 10%) |
-| Fallback | Natural cubic spline | exception (C++) | circle windows |
-| Torsion | N/A (2D) | Implicit via tilting planes | Implicit via tilting planes |
-| Exact reproduction | Conics | Circles and circular arcs | Conics (ellipse, hyperbola, parabola) |
-| Ambient dimension | 2D only | nD (any Dim ≥ 2) | nD (any Dim ≥ 2) |
-| Minimum n | 6 | 4 | 6 |
-| Language | Python | C++17 header-only | C++17 header-only |
+| Property | conicspline (2D) | conicblend circle | conicblend conic | conicblend cylinder |
+|---|---|---|---|---|
+| Window size | 5 points | 3 points | 5 points | 5 points |
+| Window type | Conic arc | Circle arc | Conic arc | Cylinder geodesic |
+| Fitting | SVD null-space (5×6) | Cramer's rule (2×2) | SVD null-space (5×6) + best-fit plane | 2D Newton on 3×3 minors (Lichtblau) |
+| Orbit parameter | phi = 2·arctan(s) | angle via atan2 | cross-ratio r_i = q_i/(q_i+1) | Lagrange in (r·φ, z) re-rolled |
+| Invariance | similarity | similarity | **affine** (exact); projective (~8e-9 at 10%) | Euclidean (axis is metric) |
+| Fallback | Natural cubic spline | exception (C++) | circle windows | best-fit cylinder → Lagrange |
+| Torsion | N/A (2D) | Implicit via tilting planes | O(κτh³) leakage from plane projection | Captured: cylinder encodes κ and τ |
+| Exact reproduction | Conics | Circles and circular arcs | Conics | Geodesics on cylinders (helices, circles, lines) |
+| Ambient dimension | 2D only | nD (any Dim ≥ 2) | nD (any Dim ≥ 2) | 3D only |
+| Minimum n | 6 | 4 | 6 | 6 |
+| Language | Python | C++17 header-only | C++17 header-only | C++17 header-only |
 
 ---
 
@@ -563,9 +641,12 @@ gives O(h²) convergence once the angular steps are small.
 |---|---|
 | `conicblend_circle.hpp` | 3-pt circle windows: namespace `fc`, `template<int Dim>`, `VecN`/`CircleND`/`CircleWindow`/`blend_curve`; 3D aliases; `circle_tag`/`conic_tag` stub; `FC_NO_EXCEPTIONS` |
 | `conicblend.hpp` | 5-pt conic windows: `ConicWindow<Dim>`, cross-ratio orbit, `SymEig<N>` Jacobi SVD, `Pchip5`, `best_fit_plane<Dim>`; `blend_curve(..., conic_tag{})` |
+| `conicblend_cylinder.hpp` | 3D cylinder windows: `CylSol`, `cyl_solve` (2D-Newton Lichtblau), `CylinderWindow<3>`, `blend_curve(..., cylinder_tag{})` |
 | `demo.cpp` | 13 tests (3D circle): helix, torus knot, C^N, collinearity, exact circle, input validation, n=4, large arc, clockwise, tilted circle, non-uniform times, N=1/N=3, tag dispatch |
 | `demo_nd.cpp` | 6 tests (nD circle): Dim=2 circle, Dim=3 helix, Dim=4 torus, collinearity, near-collinear fallback, input validation |
 | `demo_conic.cpp` | 9 tests (5-pt conic): tilted ellipse (~2e-14), parabola (~3.5e-15), 3D helix (~1.3e-15), 4D ellipse (~2.3e-14), input validation, used_conic_flag, C^N continuity, similarity invariance (~2e-14), **affine invariance (~2e-13)** |
+| `demo_cylinder.cpp` | 2 tests (3D cylinder): helix (~2e-15 exact), twisted cubic (53–601× improvement vs conic) |
+| `diag_cylinder2.cpp` | Diagnostic: 2D-Newton cylinder solver survey; all real solutions per window for helix and twisted cubic |
 | `CMakeLists.txt` | CMake build: targets `demo`, `demo_nd`, `demo_conic` |
 | `frenet_blend_proto.py` | Python prototype: position-space and Frenet-space blend comparison |
 | `demo_curves.py` | Six 3D test curves with window-arc visualisation and τ coloring |
